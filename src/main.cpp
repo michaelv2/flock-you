@@ -161,6 +161,24 @@ static volatile int last_rssi = -100;
 static bool display_in_alert_mode = false;
 static unsigned long last_display_update = 0;
 #define DISPLAY_UPDATE_INTERVAL 250  // ms, throttle SPI writes
+
+// Braille spinner: each byte is a bitmask of which dots to draw
+// Bit-to-dot mapping follows Unicode braille pattern:
+//   bit0=dot1(r0,c0) bit1=dot2(r1,c0) bit2=dot3(r2,c0)
+//   bit3=dot4(r0,c1) bit4=dot5(r1,c1) bit5=dot6(r2,c1)
+//   bit6=dot7(r3,c0) bit7=dot8(r3,c1)
+static uint8_t spinner_frame = 0;
+static const uint8_t spinner_patterns[] = {
+    0xFE, // ⣾ all except dot 1
+    0xFD, // ⣽ all except dot 2
+    0xFB, // ⣻ all except dot 3
+    0xBF, // ⢿ all except dot 7
+    0x7F, // ⡿ all except dot 8
+    0xDF, // ⣟ all except dot 6
+    0xEF, // ⣯ all except dot 5
+    0xF7, // ⣷ all except dot 4
+};
+#define SPINNER_FRAMES 8
 #endif
 
 // ============================================================================
@@ -226,6 +244,29 @@ void display_init()
     tft.fillScreen(ST77XX_BLACK);
 }
 
+// Draw a braille dot pattern at (x, y). The pattern byte maps bits to a
+// 2-column x 4-row dot grid following the Unicode braille layout.
+void draw_braille_spinner(int x, int y, uint8_t pattern, uint16_t color)
+{
+    const int dot_r = 2;   // dot radius
+    const int col_sp = 8;  // horizontal spacing between columns
+    const int row_sp = 5;  // vertical spacing between rows
+    // bit -> (column, row)
+    const int dot_col[] = {0, 0, 0, 1, 1, 1, 0, 1};
+    const int dot_row[] = {0, 1, 2, 0, 1, 2, 3, 3};
+
+    // Clear the spinner cell area
+    tft.fillRect(x - 1, y - 1, col_sp + dot_r * 2 + 2, row_sp * 3 + dot_r * 2 + 2, ST77XX_BLACK);
+
+    for (int i = 0; i < 8; i++) {
+        if (pattern & (1 << i)) {
+            int cx = x + dot_col[i] * col_sp + dot_r;
+            int cy = y + dot_row[i] * row_sp + dot_r;
+            tft.fillCircle(cx, cy, dot_r, color);
+        }
+    }
+}
+
 void display_scanning_status()
 {
     tft.fillScreen(ST77XX_BLACK);
@@ -236,15 +277,31 @@ void display_scanning_status()
     tft.setCursor(30, 10);
     tft.print("FLOCK SQUAWK");
 
-    // Row 2: Scanning indicator
+    // Row 2: "SCANNING" + braille spinner
     tft.setTextSize(2);
     tft.setTextColor(ST77XX_GREEN);
-    tft.setCursor(42, 50);
-    tft.print("SCANNING...");
+    tft.setCursor(36, 50);
+    tft.print("SCANNING ");
+    draw_braille_spinner(144, 48, spinner_patterns[spinner_frame], ST77XX_GREEN);
 
     // Row 3: Channel/BLE status
     tft.setTextSize(1);
-    tft.setTextColor(ST77XX_CYAN);
+    tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+    tft.setCursor(20, 90);
+    char status_line[40];
+    snprintf(status_line, sizeof(status_line), "WiFi CH: %02d | BLE: ON", current_channel);
+    tft.print(status_line);
+}
+
+// Lightweight partial update: only redraws the spinner and channel line
+void display_update_scanning_info()
+{
+    spinner_frame = (spinner_frame + 1) % SPINNER_FRAMES;
+    draw_braille_spinner(144, 48, spinner_patterns[spinner_frame], ST77XX_GREEN);
+
+    // Redraw channel line (bg color auto-clears old text)
+    tft.setTextSize(1);
+    tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
     tft.setCursor(20, 90);
     char status_line[40];
     snprintf(status_line, sizeof(status_line), "WiFi CH: %02d | BLE: ON", current_channel);
@@ -806,7 +863,7 @@ void hop_channel()
          printf("[WiFi] Hopped to channel %d\n", current_channel);
 #ifdef HAS_TFT
         if (!display_in_alert_mode) {
-            display_scanning_status();
+            display_update_scanning_info();
         }
 #endif
     }
