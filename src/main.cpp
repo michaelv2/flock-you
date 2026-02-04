@@ -11,12 +11,22 @@
 #include "esp_wifi.h"
 #include "esp_wifi_types.h"
 
+#ifdef HAS_TFT
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+#include <SPI.h>
+#endif
+
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
 
 // Hardware Configuration
+#ifdef BUZZER_PIN_OVERRIDE
+#define BUZZER_PIN BUZZER_PIN_OVERRIDE
+#else
 #define BUZZER_PIN 3  // GPIO3 (D2) - PWM capable pin on Xiao ESP32 S3
+#endif
 
 // Audio Configuration
 #define LOW_FREQ 200      // Boot sequence - low pitch
@@ -135,7 +145,23 @@ static unsigned long last_detection_time = 0;
 static unsigned long last_heartbeat = 0;
 static NimBLEScan* pBLEScan;
 
+#ifdef HAS_TFT
+// Adafruit ESP32-S3 Reverse TFT Feather pin assignments
+#define TFT_CS        42
+#define TFT_DC        40
+#define TFT_RST       41
+#define TFT_BACKLITE  45
+#define TFT_I2C_POWER 21
 
+Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
+
+// Display state
+static volatile bool display_needs_update = false;
+static volatile int last_rssi = -100;
+static bool display_in_alert_mode = false;
+static unsigned long last_display_update = 0;
+#define DISPLAY_UPDATE_INTERVAL 250  // ms, throttle SPI writes
+#endif
 
 // ============================================================================
 // AUDIO SYSTEM
@@ -179,6 +205,102 @@ void heartbeat_pulse()
     delay(100);
     beep(HEARTBEAT_FREQ, HEARTBEAT_DURATION);
 }
+
+// ============================================================================
+// TFT DISPLAY FUNCTIONS
+// ============================================================================
+
+#ifdef HAS_TFT
+void display_init()
+{
+    // Power on the TFT and I2C bus
+    pinMode(TFT_I2C_POWER, OUTPUT);
+    digitalWrite(TFT_I2C_POWER, HIGH);
+    delay(10);
+
+    pinMode(TFT_BACKLITE, OUTPUT);
+    digitalWrite(TFT_BACKLITE, HIGH);
+
+    tft.init(135, 240);
+    tft.setRotation(1);  // Landscape: 240 wide x 135 tall
+    tft.fillScreen(ST77XX_BLACK);
+}
+
+void display_scanning_status()
+{
+    tft.fillScreen(ST77XX_BLACK);
+
+    // Row 1: Title
+    tft.setTextSize(2);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setCursor(30, 10);
+    tft.print("FLOCK SQUAWK");
+
+    // Row 2: Scanning indicator
+    tft.setTextSize(2);
+    tft.setTextColor(ST77XX_GREEN);
+    tft.setCursor(42, 50);
+    tft.print("SCANNING...");
+
+    // Row 3: Channel/BLE status
+    tft.setTextSize(1);
+    tft.setTextColor(ST77XX_CYAN);
+    tft.setCursor(20, 90);
+    char status_line[40];
+    snprintf(status_line, sizeof(status_line), "WiFi CH: %02d | BLE: ON", current_channel);
+    tft.print(status_line);
+}
+
+void display_detection_alert(int rssi)
+{
+    // Row 1: Alert title
+    tft.setTextSize(2);
+    tft.setTextColor(ST77XX_YELLOW);
+    tft.setCursor(42, 10);
+    tft.print("!! ALERT !!");
+
+    // Row 2: Detection text
+    tft.setTextSize(2);
+    tft.setTextColor(ST77XX_RED);
+    tft.setCursor(6, 50);
+    tft.print("FLOCK DETECTED");
+
+    // Row 3: Signal strength bar
+    int bar_x = 20;
+    int bar_y = 90;
+    int bar_w = 200;
+    int bar_h = 20;
+
+    // Background bar (dark gray)
+    tft.fillRect(bar_x, bar_y, bar_w, bar_h, 0x4208);
+
+    // Calculate fill width from RSSI
+    int clamped = constrain(rssi, -100, -30);
+    int fill_w = map(clamped, -100, -30, 0, bar_w);
+
+    // Color based on signal strength
+    uint16_t bar_color;
+    if (rssi > -50) {
+        bar_color = ST77XX_GREEN;
+    } else if (rssi > -70) {
+        bar_color = ST77XX_YELLOW;
+    } else {
+        bar_color = ST77XX_RED;
+    }
+
+    if (fill_w > 0) {
+        tft.fillRect(bar_x, bar_y, fill_w, bar_h, bar_color);
+    }
+
+    // RSSI label below bar
+    tft.setTextSize(1);
+    tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+    tft.setCursor(bar_x, 115);
+    char rssi_label[24];
+    snprintf(rssi_label, sizeof(rssi_label), "RSSI: %d dBm    ", rssi);
+    tft.print(rssi_label);
+}
+#endif
 
 // ============================================================================
 // JSON OUTPUT FUNCTIONS
@@ -533,9 +655,13 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type)
         }
         // Always update detection time for heartbeat tracking
         last_detection_time = millis();
+#ifdef HAS_TFT
+        last_rssi = ppkt->rx_ctrl.rssi;
+        display_needs_update = true;
+#endif
         return;
     }
-    
+
     // Check MAC address
     if (check_mac_prefix(hdr->addr2)) {
         const char* detection_type = (frame_type == 0x20) ? "probe_request_mac" : "beacon_mac";
@@ -547,6 +673,10 @@ void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type)
         }
         // Always update detection time for heartbeat tracking
         last_detection_time = millis();
+#ifdef HAS_TFT
+        last_rssi = ppkt->rx_ctrl.rssi;
+        display_needs_update = true;
+#endif
         return;
     }
 }
@@ -579,9 +709,13 @@ class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
             }
             // Always update detection time for heartbeat tracking
             last_detection_time = millis();
+#ifdef HAS_TFT
+            last_rssi = rssi;
+            display_needs_update = true;
+#endif
             return;
         }
-        
+
         // Check device name
         if (!name.empty() && check_device_name_pattern(name.c_str())) {
             output_ble_detection_json(addrStr.c_str(), name.c_str(), rssi, "device_name");
@@ -591,9 +725,13 @@ class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
             }
             // Always update detection time for heartbeat tracking
             last_detection_time = millis();
+#ifdef HAS_TFT
+            last_rssi = rssi;
+            display_needs_update = true;
+#endif
             return;
         }
-        
+
         // Check for Raven surveillance device service UUIDs
         char detected_service_uuid[41] = {0};
         if (check_raven_service_uuid(advertisedDevice, detected_service_uuid)) {
@@ -642,6 +780,10 @@ class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
             }
             // Always update detection time for heartbeat tracking
             last_detection_time = millis();
+#ifdef HAS_TFT
+            last_rssi = rssi;
+            display_needs_update = true;
+#endif
             return;
         }
     }
@@ -662,6 +804,11 @@ void hop_channel()
         esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
         last_channel_hop = now;
          printf("[WiFi] Hopped to channel %d\n", current_channel);
+#ifdef HAS_TFT
+        if (!display_in_alert_mode) {
+            display_scanning_status();
+        }
+#endif
     }
 }
 
@@ -678,7 +825,12 @@ void setup()
     pinMode(BUZZER_PIN, OUTPUT);
     digitalWrite(BUZZER_PIN, LOW);
     boot_beep_sequence();
-    
+
+#ifdef HAS_TFT
+    display_init();
+    display_scanning_status();
+#endif
+
     printf("Starting Flock Squawk Enhanced Detection System...\n\n");
     
     // Initialize WiFi in promiscuous mode
@@ -728,9 +880,26 @@ void loop()
             printf("Device out of range - stopping heartbeat\n");
             device_in_range = false;
             triggered = false; // Allow new detections
+#ifdef HAS_TFT
+            display_in_alert_mode = false;
+            display_scanning_status();
+#endif
         }
     }
     
+#ifdef HAS_TFT
+    // Update display if needed (throttled)
+    if (display_needs_update && (millis() - last_display_update >= DISPLAY_UPDATE_INTERVAL)) {
+        if (!display_in_alert_mode) {
+            tft.fillScreen(ST77XX_BLACK);
+            display_in_alert_mode = true;
+        }
+        display_detection_alert(last_rssi);
+        display_needs_update = false;
+        last_display_update = millis();
+    }
+#endif
+
     if (millis() - last_ble_scan >= BLE_SCAN_INTERVAL && !pBLEScan->isScanning()) {
         printf("[BLE] scan...\n");
         pBLEScan->start(BLE_SCAN_DURATION, false);
