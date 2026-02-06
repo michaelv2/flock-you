@@ -269,11 +269,19 @@ def flock_reader():
                             # Try to parse as detection data
                             try:
                                 data = json.loads(line)
-                                if 'detection_method' in data:
-                                    # This is a detection, add it
+                                msg_type = data.get('type')
+
+                                if msg_type == 'verbose':
+                                    # Verbose WiFi/BLE summaries -> serial terminal only
+                                    safe_socket_emit('verbose_data', data, room='serial_terminal')
+                                elif msg_type == 'status':
+                                    # Status changes (e.g. verbose toggle) -> all clients
+                                    safe_socket_emit('verbose_status', data)
+                                elif msg_type == 'detection' or 'detection_method' in data:
+                                    # Detection event (type tag or legacy without type)
                                     add_detection_from_serial(data)
                                 else:
-                                    print(f"JSON data without detection_method: {data}")
+                                    print(f"JSON data with unknown type: {data}")
                             except json.JSONDecodeError:
                                 # Not JSON, just log it
                                 print(f"Flock device (non-JSON): {line}")

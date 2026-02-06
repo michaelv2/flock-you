@@ -406,6 +406,15 @@
             color: #fbbf24;
         }
 
+        .serial-line.verbose {
+            color: #d946ef;
+        }
+
+        .serial-line.status {
+            color: #a78bfa;
+            font-weight: 600;
+        }
+
         .oui-search-container {
             background: rgba(45, 27, 105, 0.8);
             border: 1px solid #8b5cf6;
@@ -1397,6 +1406,7 @@
                             <option value="all">All Data</option>
                             <option value="sniffer">Sniffer Only</option>
                             <option value="gps">GPS Only</option>
+                            <option value="verbose">Verbose Only</option>
                         </select>
                     </div>
                     <span class="serial-status">Status: <span id="serialConnectionStatus">Disconnected</span></span>
@@ -2281,7 +2291,7 @@
 
         function shouldShowLine(text, type) {
             if (terminalFilter === 'all') return true;
-            
+
             const textLower = text.toLowerCase();
             if (terminalFilter === 'gps' && (textLower.includes('gps') || textLower.includes('$gp') || textLower.includes('$gn') || textLower.includes('nmea'))) {
                 return true;
@@ -2289,7 +2299,10 @@
             if (terminalFilter === 'sniffer' && !textLower.includes('gps') && (textLower.includes('detection') || textLower.includes('wifi') || textLower.includes('ble') || textLower.includes('mac') || textLower.includes('channel') || textLower.includes('rssi'))) {
                 return true;
             }
-            
+            if (terminalFilter === 'verbose' && (type === 'verbose' || type === 'status')) {
+                return true;
+            }
+
             return false;
         }
 
@@ -2378,7 +2391,34 @@
             }
         });
 
+        socket.on('verbose_data', function(data) {
+            if (!data) return;
+            if (data.protocol === 'wifi') {
+                let line = `[VERBOSE WiFi CH${data.channel}] ${data.total_frames} frames (${data.probe_count} probe, ${data.beacon_count} beacon), ${data.unique_macs} MACs`;
+                addSerialLine(line, 'verbose');
+                if (data.top_devices && data.top_devices.length > 0) {
+                    data.top_devices.forEach(function(d) {
+                        let devLine = `  ${d.mac} ${d.ssid || '(hidden)'} RSSI:${d.rssi} x${d.frames}`;
+                        addSerialLine(devLine, 'verbose');
+                    });
+                }
+            } else if (data.protocol === 'bluetooth_le') {
+                let line = `[VERBOSE BLE] ${data.total_devices} devices seen`;
+                addSerialLine(line, 'verbose');
+                if (data.devices && data.devices.length > 0) {
+                    data.devices.forEach(function(d) {
+                        let devLine = `  ${d.mac} ${d.name || '(unnamed)'} RSSI:${d.rssi}`;
+                        addSerialLine(devLine, 'verbose');
+                    });
+                }
+            }
+        });
 
+        socket.on('verbose_status', function(data) {
+            if (!data) return;
+            const state = data.verbose_mode ? 'ENABLED' : 'DISABLED';
+            addSerialLine(`[STATUS] Verbose mode ${state}`, 'status');
+        });
 
         socket.on('flock_reconnected', function(data) {
             updateFlockStatus(true);

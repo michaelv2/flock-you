@@ -51,6 +51,14 @@ static unsigned long last_ble_scan = 0;
 #define MAX_MAC_PATTERNS 50
 #define MAX_DEVICE_NAMES 20
 
+// Verbose Mode Configuration
+#define VERBOSE_BUTTON_PIN 0       // GPIO0 (Boot button on all variants)
+#define VERBOSE_DEBOUNCE_MS 300    // Software debounce for button
+#define VERBOSE_WIFI_MAX_MACS 32   // Max unique MACs tracked per channel dwell
+#define VERBOSE_WIFI_TOP_N 5       // Top N devices by frame count in summary
+#define VERBOSE_BLE_MAX_DEVICES 20 // Max BLE devices buffered per scan
+#define VERBOSE_BLE_OUTPUT_CAP 10  // Max BLE devices in output JSON
+
 // ============================================================================
 // DETECTION PATTERNS (Extracted from Real Flock Safety Device Databases)
 // ============================================================================
@@ -145,6 +153,44 @@ static unsigned long last_detection_time = 0;
 static unsigned long last_heartbeat = 0;
 static NimBLEScan* pBLEScan;
 
+// ============================================================================
+// VERBOSE MODE STATE
+// ============================================================================
+
+static volatile bool verbose_mode = false;
+static volatile unsigned long last_button_press = 0;
+
+// WiFi per-channel-dwell stats
+struct WifiDeviceStats {
+    uint8_t mac[6];
+    char ssid[33];
+    int rssi_sum;
+    int rssi_best;
+    uint16_t frame_count;
+    bool is_probe;  // true = probe request, false = beacon
+};
+
+static struct {
+    WifiDeviceStats devices[VERBOSE_WIFI_MAX_MACS];
+    uint8_t device_count;
+    uint32_t total_frames;
+    uint32_t probe_count;
+    uint32_t beacon_count;
+} wifi_stats;
+
+// BLE per-scan buffer for non-matched devices
+struct BleDeviceEntry {
+    char mac[18];
+    char name[33];
+    int rssi;
+    bool has_name;
+};
+
+static struct {
+    BleDeviceEntry devices[VERBOSE_BLE_MAX_DEVICES];
+    uint8_t device_count;
+} ble_verbose_buffer;
+
 #ifdef HAS_TFT
 // Adafruit ESP32-S3 Reverse TFT Feather pin assignments
 #define TFT_CS        42
@@ -180,6 +226,192 @@ static const uint8_t spinner_patterns[] = {
 };
 #define SPINNER_FRAMES 8
 #endif
+
+// ============================================================================
+// VERBOSE MODE BUTTON HANDLER
+// ============================================================================
+
+// Forward declaration (defined in Audio System section below)
+void beep(int frequency, int duration_ms);
+
+void IRAM_ATTR verbose_button_isr()
+{
+    unsigned long now = millis();
+    if (now - last_button_press > VERBOSE_DEBOUNCE_MS) {
+        verbose_mode = !verbose_mode;
+        last_button_press = now;
+    }
+}
+
+static bool verbose_pending_status = false;
+static bool verbose_last_reported = false;
+
+void verbose_check_status_change()
+{
+    if (verbose_mode != verbose_last_reported) {
+        verbose_pending_status = true;
+        verbose_last_reported = verbose_mode;
+    }
+    if (verbose_pending_status) {
+        verbose_pending_status = false;
+        // Emit status JSON
+        StaticJsonDocument<128> doc;
+        doc["type"] = "status";
+        doc["verbose_mode"] = verbose_mode;
+        serializeJson(doc, Serial);
+        Serial.println();
+        // Audio feedback: single beep = on, double beep = off
+        if (verbose_mode) {
+            beep(HIGH_FREQ, 100);
+        } else {
+            beep(HIGH_FREQ, 80);
+            delay(60);
+            beep(HIGH_FREQ, 80);
+        }
+    }
+}
+
+// Reset WiFi stats for a new channel dwell
+void verbose_wifi_stats_reset()
+{
+    wifi_stats.device_count = 0;
+    wifi_stats.total_frames = 0;
+    wifi_stats.probe_count = 0;
+    wifi_stats.beacon_count = 0;
+}
+
+// Track a WiFi frame in the stats struct (called from promiscuous callback)
+void verbose_wifi_track_frame(const uint8_t* mac, const char* ssid, int rssi, bool is_probe)
+{
+    wifi_stats.total_frames++;
+    if (is_probe) wifi_stats.probe_count++;
+    else wifi_stats.beacon_count++;
+
+    // Find existing entry or add new
+    for (int i = 0; i < wifi_stats.device_count; i++) {
+        if (memcmp(wifi_stats.devices[i].mac, mac, 6) == 0) {
+            wifi_stats.devices[i].frame_count++;
+            wifi_stats.devices[i].rssi_sum += rssi;
+            if (rssi > wifi_stats.devices[i].rssi_best) {
+                wifi_stats.devices[i].rssi_best = rssi;
+            }
+            // Update SSID if we now have one and didn't before
+            if (ssid && ssid[0] && !wifi_stats.devices[i].ssid[0]) {
+                strncpy(wifi_stats.devices[i].ssid, ssid, 32);
+                wifi_stats.devices[i].ssid[32] = '\0';
+            }
+            return;
+        }
+    }
+    // Add new device if space available
+    if (wifi_stats.device_count < VERBOSE_WIFI_MAX_MACS) {
+        WifiDeviceStats& d = wifi_stats.devices[wifi_stats.device_count];
+        memcpy(d.mac, mac, 6);
+        if (ssid && ssid[0]) {
+            strncpy(d.ssid, ssid, 32);
+            d.ssid[32] = '\0';
+        } else {
+            d.ssid[0] = '\0';
+        }
+        d.rssi_sum = rssi;
+        d.rssi_best = rssi;
+        d.frame_count = 1;
+        d.is_probe = is_probe;
+        wifi_stats.device_count++;
+    }
+}
+
+// Emit WiFi verbose summary JSON for the completed channel dwell
+void verbose_wifi_emit_summary(uint8_t channel)
+{
+    if (wifi_stats.total_frames == 0 && wifi_stats.device_count == 0) return;
+
+    DynamicJsonDocument doc(1536);
+    doc["type"] = "verbose";
+    doc["protocol"] = "wifi";
+    doc["channel"] = channel;
+    doc["total_frames"] = wifi_stats.total_frames;
+    doc["probe_count"] = wifi_stats.probe_count;
+    doc["beacon_count"] = wifi_stats.beacon_count;
+    doc["unique_macs"] = wifi_stats.device_count;
+
+    // Sort devices by frame_count descending (simple selection sort for top N)
+    // We only need the top VERBOSE_WIFI_TOP_N
+    int top_count = min((int)wifi_stats.device_count, VERBOSE_WIFI_TOP_N);
+    bool picked[VERBOSE_WIFI_MAX_MACS] = {false};
+
+    JsonArray top = doc.createNestedArray("top_devices");
+    for (int n = 0; n < top_count; n++) {
+        int best_idx = -1;
+        uint16_t best_frames = 0;
+        for (int i = 0; i < wifi_stats.device_count; i++) {
+            if (!picked[i] && wifi_stats.devices[i].frame_count > best_frames) {
+                best_frames = wifi_stats.devices[i].frame_count;
+                best_idx = i;
+            }
+        }
+        if (best_idx < 0) break;
+        picked[best_idx] = true;
+        WifiDeviceStats& d = wifi_stats.devices[best_idx];
+
+        JsonObject dev = top.createNestedObject();
+        char mac_str[18];
+        snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+                 d.mac[0], d.mac[1], d.mac[2], d.mac[3], d.mac[4], d.mac[5]);
+        dev["mac"] = mac_str;
+        if (d.ssid[0]) dev["ssid"] = d.ssid;
+        dev["rssi"] = d.rssi_best;
+        dev["frames"] = d.frame_count;
+    }
+
+    String json_output;
+    serializeJson(doc, json_output);
+    Serial.println(json_output);
+}
+
+// Buffer a BLE device for verbose output (non-matched devices only)
+void verbose_ble_buffer_device(const char* mac, const char* name, int rssi)
+{
+    if (ble_verbose_buffer.device_count >= VERBOSE_BLE_MAX_DEVICES) return;
+    BleDeviceEntry& e = ble_verbose_buffer.devices[ble_verbose_buffer.device_count];
+    strncpy(e.mac, mac, 17);
+    e.mac[17] = '\0';
+    if (name && name[0]) {
+        strncpy(e.name, name, 32);
+        e.name[32] = '\0';
+        e.has_name = true;
+    } else {
+        e.name[0] = '\0';
+        e.has_name = false;
+    }
+    e.rssi = rssi;
+    ble_verbose_buffer.device_count++;
+}
+
+// Emit BLE verbose summary JSON after scan completes
+void verbose_ble_emit_summary()
+{
+    if (ble_verbose_buffer.device_count == 0) return;
+
+    DynamicJsonDocument doc(2048);
+    doc["type"] = "verbose";
+    doc["protocol"] = "bluetooth_le";
+    doc["total_devices"] = ble_verbose_buffer.device_count;
+
+    int output_count = min((int)ble_verbose_buffer.device_count, VERBOSE_BLE_OUTPUT_CAP);
+    JsonArray devs = doc.createNestedArray("devices");
+    for (int i = 0; i < output_count; i++) {
+        BleDeviceEntry& e = ble_verbose_buffer.devices[i];
+        JsonObject dev = devs.createNestedObject();
+        dev["mac"] = e.mac;
+        if (e.has_name) dev["name"] = e.name;
+        dev["rssi"] = e.rssi;
+    }
+
+    String json_output;
+    serializeJson(doc, json_output);
+    Serial.println(json_output);
+}
 
 // ============================================================================
 // AUDIO SYSTEM
@@ -267,6 +499,20 @@ void draw_braille_spinner(int x, int y, uint8_t pattern, uint16_t color)
     }
 }
 
+// Draw or clear the VERBOSE badge in the top-right corner
+void display_verbose_badge()
+{
+    if (verbose_mode) {
+        tft.setTextSize(1);
+        tft.setTextColor(ST77XX_MAGENTA, ST77XX_BLACK);
+        tft.setCursor(190, 2);
+        tft.print("VERBOSE");
+    } else {
+        // Clear the badge area
+        tft.fillRect(190, 0, 50, 10, ST77XX_BLACK);
+    }
+}
+
 void display_scanning_status()
 {
     tft.fillScreen(ST77XX_BLACK);
@@ -276,6 +522,9 @@ void display_scanning_status()
     tft.setTextColor(ST77XX_WHITE);
     tft.setCursor(30, 10);
     tft.print("FLOCK SQUAWK");
+
+    // Verbose badge
+    display_verbose_badge();
 
     // Row 2: "SCANNING" + braille spinner
     tft.setTextSize(2);
@@ -306,6 +555,9 @@ void display_update_scanning_info()
     char status_line[40];
     snprintf(status_line, sizeof(status_line), "WiFi CH: %02d | BLE: ON", current_channel);
     tft.print(status_line);
+
+    // Update verbose badge
+    display_verbose_badge();
 }
 
 void display_detection_alert(int rssi)
@@ -315,6 +567,9 @@ void display_detection_alert(int rssi)
     tft.setTextColor(ST77XX_YELLOW);
     tft.setCursor(42, 10);
     tft.print("!! ALERT !!");
+
+    // Verbose badge
+    display_verbose_badge();
 
     // Row 2: Detection text
     tft.setTextSize(2);
@@ -366,7 +621,10 @@ void display_detection_alert(int rssi)
 void output_wifi_detection_json(const char* ssid, const uint8_t* mac, int rssi, const char* detection_type)
 {
     DynamicJsonDocument doc(2048);
-    
+
+    // Message type tag
+    doc["type"] = "detection";
+
     // Core detection info
     doc["timestamp"] = millis();
     doc["detection_time"] = String(millis() / 1000.0, 3) + "s";
@@ -436,7 +694,10 @@ void output_wifi_detection_json(const char* ssid, const uint8_t* mac, int rssi, 
 void output_ble_detection_json(const char* mac, const char* name, int rssi, const char* detection_method)
 {
     DynamicJsonDocument doc(2048);
-    
+
+    // Message type tag
+    doc["type"] = "detection";
+
     // Core detection info
     doc["timestamp"] = millis();
     doc["detection_time"] = String(millis() / 1000.0, 3) + "s";
@@ -674,33 +935,39 @@ typedef struct {
 
 void wifi_sniffer_packet_handler(void* buff, wifi_promiscuous_pkt_type_t type)
 {
-    
+
     const wifi_promiscuous_pkt_t *ppkt = (wifi_promiscuous_pkt_t *)buff;
     const wifi_ieee80211_packet_t *ipkt = (wifi_ieee80211_packet_t *)ppkt->payload;
     const wifi_ieee80211_mac_hdr_t *hdr = &ipkt->hdr;
-    
+
     // Check for probe requests (subtype 0x04) and beacons (subtype 0x08)
     uint8_t frame_type = (hdr->frame_ctrl & 0xFF) >> 2;
     if (frame_type != 0x20 && frame_type != 0x80) { // Probe request or beacon
         return;
     }
-    
+
     // Extract SSID from probe request or beacon
     char ssid[33] = {0};
     uint8_t *payload = (uint8_t *)ipkt + 24; // Skip MAC header
-    
+
     if (frame_type == 0x20) { // Probe request
         payload += 0; // Probe requests start with SSID immediately
     } else { // Beacon frame
         payload += 12; // Skip fixed parameters in beacon
     }
-    
+
     // Parse SSID element (tag 0, length, data)
     if (payload[0] == 0 && payload[1] <= 32) {
         memcpy(ssid, &payload[2], payload[1]);
         ssid[payload[1]] = '\0';
     }
-    
+
+    // Track frame in verbose stats (always, regardless of match)
+    if (verbose_mode) {
+        bool is_probe = (frame_type == 0x20);
+        verbose_wifi_track_frame(hdr->addr2, ssid, ppkt->rx_ctrl.rssi, is_probe);
+    }
+
     // Check if SSID matches our patterns
     if (strlen(ssid) > 0 && check_ssid_pattern(ssid)) {
         const char* detection_type = (frame_type == 0x20) ? "probe_request" : "beacon";
@@ -798,6 +1065,7 @@ class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
             
             // Create enhanced JSON output with Raven-specific data
             StaticJsonDocument<1024> doc;
+            doc["type"] = "detection";
             doc["protocol"] = "bluetooth_le";
             doc["detection_method"] = "raven_service_uuid";
             doc["device_type"] = "RAVEN_GUNSHOT_DETECTOR";
@@ -843,6 +1111,11 @@ class AdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
 #endif
             return;
         }
+
+        // No match — buffer for verbose output if enabled
+        if (verbose_mode) {
+            verbose_ble_buffer_device(addrStr.c_str(), name.c_str(), rssi);
+        }
     }
 };
 
@@ -854,13 +1127,19 @@ void hop_channel()
 {
     unsigned long now = millis();
     if (now - last_channel_hop > CHANNEL_HOP_INTERVAL) {
+        // Emit verbose WiFi summary for the channel we're leaving
+        if (verbose_mode) {
+            verbose_wifi_emit_summary(current_channel);
+            verbose_wifi_stats_reset();
+        }
+
         current_channel++;
         if (current_channel > MAX_CHANNEL) {
             current_channel = 1;
         }
         esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
         last_channel_hop = now;
-         printf("[WiFi] Hopped to channel %d\n", current_channel);
+        printf("[WiFi] Hopped to channel %d\n", current_channel);
 #ifdef HAS_TFT
         if (!display_in_alert_mode) {
             display_update_scanning_info();
@@ -882,6 +1161,13 @@ void setup()
     pinMode(BUZZER_PIN, OUTPUT);
     digitalWrite(BUZZER_PIN, LOW);
     boot_beep_sequence();
+
+    // Initialize verbose mode button (GPIO0 / Boot button)
+    pinMode(VERBOSE_BUTTON_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(VERBOSE_BUTTON_PIN), verbose_button_isr, FALLING);
+    verbose_wifi_stats_reset();
+    ble_verbose_buffer.device_count = 0;
+    verbose_last_reported = verbose_mode;
 
 #ifdef HAS_TFT
     display_init();
@@ -919,9 +1205,12 @@ void setup()
 
 void loop()
 {
+    // Check for verbose mode toggle (button ISR sets the flag)
+    verbose_check_status_change();
+
     // Handle channel hopping for WiFi promiscuous mode
     hop_channel();
-    
+
     // Handle heartbeat pulse if device is in range
     if (device_in_range) {
         unsigned long now = millis();
@@ -959,11 +1248,17 @@ void loop()
 
     if (millis() - last_ble_scan >= BLE_SCAN_INTERVAL && !pBLEScan->isScanning()) {
         printf("[BLE] scan...\n");
+        // Reset verbose BLE buffer before each scan
+        ble_verbose_buffer.device_count = 0;
         pBLEScan->start(BLE_SCAN_DURATION, false);
         last_ble_scan = millis();
     }
-    
+
     if (pBLEScan->isScanning() == false && millis() - last_ble_scan > BLE_SCAN_DURATION * 1000) {
+        // Emit verbose BLE summary after scan completes
+        if (verbose_mode) {
+            verbose_ble_emit_summary();
+        }
         pBLEScan->clearResults();
     }
     
