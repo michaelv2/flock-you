@@ -1,5 +1,7 @@
 # Flock You: Flock Safety Detection System
 
+Forked from [colonelpanichacks/flock-you](https://github.com/colonelpanichacks/flock-you)
+
 <img src="flock.png" alt="Flock You" width="300px">
 
 **Professional surveillance camera detection for the Oui-Spy device available at [colonelpanic.tech](https://colonelpanic.tech)**
