@@ -1,6 +1,8 @@
 # Flock You: Flock Safety Detection System
 
-Forked from [colonelpanichacks/flock-you](https://github.com/colonelpanichacks/flock-you)
+Forked from [colonelpanichacks/flock-you](https://github.com/colonelpanichacks/flock-you) to run on a single [ESP32-S3 Rev. TFT board](https://www.adafruit.com/product/5691). There is also a [version](https://www.adafruit.com/product/6303) with a w.FL antenna for additional range.
+
+STL files for an enclosure to follow.
 
 <img src="flock.png" alt="Flock You" width="300px">
 
